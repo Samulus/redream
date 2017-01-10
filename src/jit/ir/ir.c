@@ -441,10 +441,11 @@ struct ir_value *ir_load_local(struct ir *ir, struct ir_local *local) {
   return instr->result;
 }
 
-void ir_store_local(struct ir *ir, struct ir_local *local, struct ir_value *v) {
+struct ir_instr *ir_store_local(struct ir *ir, struct ir_local *local, struct ir_value *v) {
   struct ir_instr *instr = ir_append_instr(ir, OP_STORE_LOCAL, VALUE_V);
   ir_set_arg0(ir, instr, local->offset);
   ir_set_arg1(ir, instr, v);
+  return instr;
 }
 
 struct ir_value *ir_ftoi(struct ir *ir, struct ir_value *v,

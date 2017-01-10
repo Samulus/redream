@@ -28,7 +28,7 @@ extern "C" {
    RIP-relative offsets when calling functions */
 uint8_t sh4_code[CODE_SIZE];
 int sh4_code_size = CODE_SIZE;
-int sh4_stack_size = 1024;
+int sh4_stack_size = 4096;
 static void *sh4_cache[CACHE_SIZE];
 static int sh4_cache_size = CACHE_SIZE;
 static uint8_t sh4_dispatch[DISPATCH_SIZE];

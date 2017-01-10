@@ -1537,11 +1537,11 @@ EMITTER(BRANCH) {
   if (instr->arg[0]->type == VALUE_BLOCK) {
     char name[128];
     x64_backend_block_label(name, sizeof(name), instr->arg[0]->blk);
-    e.jmp(name);
+    e.jmp(name, Xbyak::CodeGenerator::T_NEAR);
   } else if (instr->arg[0]->type == VALUE_STRING) {
     char name[128];
     x64_backend_label_name(name, sizeof(name), instr->arg[0]);
-    e.jmp(name);
+    e.jmp(name, Xbyak::CodeGenerator::T_NEAR);
   } else {
     void *dst = (void *)instr->arg[0]->i64;
     e.jmp(dst);
@@ -1553,7 +1553,11 @@ EMITTER(BRANCH_FALSE) {
 
   e.test(cond, cond);
 
-  if (instr->arg[0]->type == VALUE_STRING) {
+  if (instr->arg[0]->type == VALUE_BLOCK) {
+    char name[128];
+    x64_backend_block_label(name, sizeof(name), instr->arg[0]->blk);
+    e.jnz(name, Xbyak::CodeGenerator::T_NEAR);
+  } else if (instr->arg[0]->type == VALUE_STRING) {
     char name[128];
     x64_backend_label_name(name, sizeof(name), instr->arg[0]);
     e.jz(name);
@@ -1568,10 +1572,14 @@ EMITTER(BRANCH_TRUE) {
 
   e.test(cond, cond);
 
-  if (instr->arg[0]->type == VALUE_STRING) {
+  if (instr->arg[0]->type == VALUE_BLOCK) {
+    char name[128];
+    x64_backend_block_label(name, sizeof(name), instr->arg[0]->blk);
+    e.jz(name, Xbyak::CodeGenerator::T_NEAR);
+  } else if (instr->arg[0]->type == VALUE_STRING) {
     char name[128];
     x64_backend_label_name(name, sizeof(name), instr->arg[0]);
-    e.jnz(name);
+    e.jz(name, Xbyak::CodeGenerator::T_NEAR);
   } else {
     void *dst = (void *)instr->arg[0]->i64;
     e.jnz(dst);

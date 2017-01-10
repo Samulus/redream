@@ -86,6 +86,8 @@ struct ir_value {
 
   /* generic meta data used by optimization passes */
   intptr_t tag;
+
+  void *interval;
 };
 
 struct ir_instr {
@@ -282,7 +284,7 @@ void ir_store_context(struct ir *ir, size_t offset, struct ir_value *v);
 
 /* local operations */
 struct ir_value *ir_load_local(struct ir *ir, struct ir_local *local);
-void ir_store_local(struct ir *ir, struct ir_local *local, struct ir_value *v);
+struct ir_instr *ir_store_local(struct ir *ir, struct ir_local *local, struct ir_value *v);
 
 /* cast / conversion operations */
 struct ir_value *ir_ftoi(struct ir *ir, struct ir_value *v,

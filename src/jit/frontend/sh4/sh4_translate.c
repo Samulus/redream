@@ -1529,6 +1529,9 @@ EMITTER(OCBWB) {}
 
 // PREF     @Rn
 EMITTER(PREF) {
+  struct ir_block *pref_block = ir_append_block(ir);
+  struct ir_block *skip_block = ir_append_block(ir);
+
   /* check that the address is between 0xe0000000 and 0xe3ffffff */
   struct ir_value *addr = load_gpr(i->Rn, VALUE_I32);
   struct ir_value *cond = ir_lshr(ir, addr, ir_alloc_i32(ir, 26));
@@ -1536,10 +1539,13 @@ EMITTER(PREF) {
   struct ir_value *skip = ir_alloc_str(ir, "skip_%p", cond);
   ir_branch_true(ir, skip, cond);
 
+  ir_set_current_block(ir, pref_block);
   struct ir_value *data = ir_alloc_ptr(ir, frontend->data);
   struct ir_value *sq_prefetch = ir_alloc_ptr(ir, frontend->sq_prefetch);
   ir_call_2(ir, sq_prefetch, data, addr);
   ir_label(ir, skip);
+
+  ir_set_current_block(ir, skip_block);
 }
 
 // RTE
