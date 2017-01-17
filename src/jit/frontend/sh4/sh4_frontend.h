@@ -5,6 +5,7 @@
 
 struct ir;
 struct jit;
+struct jit_block_meta;
 
 enum {
   SH4_FASTMEM = 0x1,
@@ -18,7 +19,7 @@ struct sh4_frontend {
 
   /* runtime interface */
   void *data;
-  void (*translate)(void *, uint32_t, struct ir *, int, int *);
+  void (*translate)(void *, struct jit_code *, struct ir *);
   void (*invalid_instr)(void *, uint32_t);
   void (*sq_prefetch)(void *, uint32_t);
   void (*sr_updated)(void *, uint32_t);

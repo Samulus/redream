@@ -120,8 +120,8 @@ static void ir_write_instr(const struct ir_instr *instr, FILE *output) {
     need_comma = 1;
   }
 
-#if 0
-  fprintf(output, "[tag %" PRId64 ", reg %d]", instr->tag, instr->result ? instr->result->reg : -1);
+#if 1
+  fprintf(output, " [tag %" PRId64 ", reg %d]", instr->tag, instr->result ? instr->result->reg : -1);
 #endif
 
   fprintf(output, "\n");

@@ -1,7 +1,6 @@
 #include "jit/frontend/sh4/sh4_translate.h"
 #include "core/assert.h"
 #include "core/profiler.h"
-#include "jit/frontend/sh4/sh4_analyze.h"
 #include "jit/frontend/sh4/sh4_context.h"
 #include "jit/frontend/sh4/sh4_disasm.h"
 #include "jit/frontend/sh4/sh4_frontend.h"
@@ -18,11 +17,11 @@ static uint32_t s_fsca_table[0x20000] = {
 /*
  * callbacks for translating each sh4 op
  */
-typedef void (*emit_cb)(struct sh4_frontend *frontend, struct ir *, int,
+typedef void (*emit_cb)(struct sh4_frontend *frontend, struct jit_compile_unit *unit, struct ir *, int,
                         const struct sh4_instr *, const struct sh4_instr *);
 
 #define EMITTER(name)                                                   \
-  void sh4_emit_OP_##name(struct sh4_frontend *frontend, struct ir *ir, \
+  void sh4_emit_OP_##name(struct sh4_frontend *frontend, struct jit_compile_unit *unit, struct ir *ir, \
                           int flags, const struct sh4_instr *i,         \
                           const struct sh4_instr *delay)
 
@@ -43,7 +42,7 @@ static emit_cb emit_callbacks[NUM_SH4_OPS] = {
 /* swizzle 32-bit fp loads, see notes in sh4_context.h */
 #define swizzle_fpr(n, type) (ir_type_size(type) == 4 ? ((n) ^ 1) : (n))
 
-#define emit_delay_instr() sh4_emit_instr(frontend, ir, flags, delay, NULL)
+#define emit_delay_instr() sh4_emit_instr(frontend, unit, ir, flags, delay, NULL)
 #define load_guest(addr, type) ir_load_guest(ir, flags, addr, type)
 #define store_guest(addr, v) ir_store_guest(ir, flags, addr, v)
 #define load_gpr(n, type) ir_load_gpr(ir, n, type)
@@ -64,9 +63,6 @@ static emit_cb emit_callbacks[NUM_SH4_OPS] = {
 #define store_fpscr(v) ir_store_fpscr(frontend, ir, v)
 #define load_pr() ir_load_pr(ir)
 #define store_pr(v) ir_store_pr(ir, v)
-#define branch(addr) ir_branch_guest(frontend, ir, addr)
-#define branch_false(addr, cond) ir_branch_false_guest(frontend, ir, addr, cond)
-#define branch_true(addr, cond) ir_branch_true_guest(frontend, ir, addr, cond)
 
 static struct ir_value *ir_load_guest(struct ir *ir, int flags,
                                       struct ir_value *addr,
@@ -212,38 +208,16 @@ static void ir_store_pr(struct ir *ir, struct ir_value *v) {
   ir_store_context(ir, offsetof(struct sh4_ctx, pr), v);
 }
 
-static void ir_branch_guest(struct sh4_frontend *frontend, struct ir *ir,
-                            struct ir_value *addr) {
-  ir_store_context(ir, offsetof(struct sh4_ctx, pc), addr);
-}
-
-static void ir_branch_false_guest(struct sh4_frontend *frontend, struct ir *ir,
-                                  struct ir_value *addr,
-                                  struct ir_value *cond) {
-  struct ir_value *skip = ir_alloc_str(ir, "skip_%p", addr);
-  ir_branch_true(ir, skip, cond);
-  ir_store_context(ir, offsetof(struct sh4_ctx, pc), addr);
-  ir_label(ir, skip);
-}
-
-static void ir_branch_true_guest(struct sh4_frontend *frontend, struct ir *ir,
-                                 struct ir_value *addr, struct ir_value *cond) {
-  struct ir_value *skip = ir_alloc_str(ir, "skip_%p", addr);
-  ir_branch_false(ir, skip, cond);
-  ir_store_context(ir, offsetof(struct sh4_ctx, pc), addr);
-  ir_label(ir, skip);
-}
-
-void sh4_emit_instr(struct sh4_frontend *frontend, struct ir *ir, int flags,
+void sh4_emit_instr(struct sh4_frontend *frontend, struct jit_compile_unit *unit, struct ir *ir, int flags,
                     const struct sh4_instr *instr,
                     const struct sh4_instr *delay) {
   /* emit extra debug info for recc */
-  if (frontend->jit->dump_blocks) {
+  if (frontend->jit->dump_code) {
     const char *name = sh4_opdefs[instr->op].name;
     ir_debug_info(ir, name, instr->addr, instr->opcode);
   }
 
-  (emit_callbacks[instr->op])(frontend, ir, flags, instr, delay);
+  (emit_callbacks[instr->op])(frontend, unit, ir, flags, instr, delay);
 }
 
 // INVALID
@@ -1233,9 +1207,8 @@ EMITTER(SHLR16) {
 // 1000 1011 dddd dddd  3/1     -
 // BF      disp
 EMITTER(BF) {
-  uint32_t dest_addr = ((int8_t)i->disp * 2) + i->addr + 4;
   struct ir_value *cond = load_t();
-  branch_false(ir_alloc_i32(ir, dest_addr), cond);
+  unit->branch_cond = cond;
 }
 
 // code                 cycles  t-bit
@@ -1244,17 +1217,15 @@ EMITTER(BF) {
 EMITTER(BFS) {
   struct ir_value *cond = load_t();
   emit_delay_instr();
-  uint32_t dest_addr = ((int8_t)i->disp * 2) + i->addr + 4;
-  branch_false(ir_alloc_i32(ir, dest_addr), cond);
+  unit->branch_cond = cond;
 }
 
 // code                 cycles  t-bit
 // 1000 1001 dddd dddd  3/1     -
 // BT      disp
 EMITTER(BT) {
-  uint32_t dest_addr = ((int8_t)i->disp * 2) + i->addr + 4;
   struct ir_value *cond = load_t();
-  branch_true(ir_alloc_i32(ir, dest_addr), cond);
+  unit->branch_cond = cond;
 }
 
 // code                 cycles  t-bit
@@ -1263,8 +1234,7 @@ EMITTER(BT) {
 EMITTER(BTS) {
   struct ir_value *cond = load_t();
   emit_delay_instr();
-  uint32_t dest_addr = ((int8_t)i->disp * 2) + i->addr + 4;
-  branch_true(ir_alloc_i32(ir, dest_addr), cond);
+  unit->branch_cond = cond;
 }
 
 // code                 cycles  t-bit
@@ -1272,10 +1242,6 @@ EMITTER(BTS) {
 // BRA     disp
 EMITTER(BRA) {
   emit_delay_instr();
-  int32_t disp = ((i->disp & 0xfff) << 20) >>
-                 20; /* 12-bit displacement must be sign extended */
-  uint32_t dest_addr = (disp * 2) + i->addr + 4;
-  branch(ir_alloc_i32(ir, dest_addr));
 }
 
 // code                 cycles  t-bit
@@ -1285,7 +1251,7 @@ EMITTER(BRAF) {
   struct ir_value *rn = load_gpr(i->Rn, VALUE_I32);
   emit_delay_instr();
   struct ir_value *dest_addr = ir_add(ir, ir_alloc_i32(ir, i->addr + 4), rn);
-  branch(dest_addr);
+  unit->branch_dest = dest_addr;
 }
 
 // code                 cycles  t-bit
@@ -1293,12 +1259,8 @@ EMITTER(BRAF) {
 // BSR     disp
 EMITTER(BSR) {
   emit_delay_instr();
-  int32_t disp = ((i->disp & 0xfff) << 20) >>
-                 20; /* 12-bit displacement must be sign extended */
   uint32_t ret_addr = i->addr + 4;
-  uint32_t dest_addr = ret_addr + disp * 2;
   store_pr(ir_alloc_i32(ir, ret_addr));
-  branch(ir_alloc_i32(ir, dest_addr));
 }
 
 // code                 cycles  t-bit
@@ -1310,14 +1272,14 @@ EMITTER(BSRF) {
   struct ir_value *ret_addr = ir_alloc_i32(ir, i->addr + 4);
   struct ir_value *dest_addr = ir_add(ir, rn, ret_addr);
   store_pr(ret_addr);
-  branch(dest_addr);
+  unit->branch_dest = dest_addr;
 }
 
 // JMP     @Rm
 EMITTER(JMP) {
   struct ir_value *dest_addr = load_gpr(i->Rn, VALUE_I32);
   emit_delay_instr();
-  branch(dest_addr);
+  unit->branch_dest = dest_addr;
 }
 
 // JSR     @Rn
@@ -1326,14 +1288,14 @@ EMITTER(JSR) {
   emit_delay_instr();
   struct ir_value *ret_addr = ir_alloc_i32(ir, i->addr + 4);
   store_pr(ret_addr);
-  branch(dest_addr);
+  unit->branch_dest = dest_addr;
 }
 
 // RTS
 EMITTER(RTS) {
   struct ir_value *dest_addr = load_pr();
   emit_delay_instr();
-  branch(dest_addr);
+  unit->branch_dest = dest_addr;
 }
 
 // code                 cycles  t-bit
@@ -1529,23 +1491,14 @@ EMITTER(OCBWB) {}
 
 // PREF     @Rn
 EMITTER(PREF) {
-  struct ir_block *pref_block = ir_append_block(ir);
-  struct ir_block *skip_block = ir_append_block(ir);
-
   /* check that the address is between 0xe0000000 and 0xe3ffffff */
   struct ir_value *addr = load_gpr(i->Rn, VALUE_I32);
   struct ir_value *cond = ir_lshr(ir, addr, ir_alloc_i32(ir, 26));
-  cond = ir_cmp_ne(ir, cond, ir_alloc_i32(ir, 0x38));
-  struct ir_value *skip = ir_alloc_str(ir, "skip_%p", cond);
-  ir_branch_true(ir, skip, cond);
+  cond = ir_cmp_eq(ir, cond, ir_alloc_i32(ir, 0x38));
 
-  ir_set_current_block(ir, pref_block);
   struct ir_value *data = ir_alloc_ptr(ir, frontend->data);
   struct ir_value *sq_prefetch = ir_alloc_ptr(ir, frontend->sq_prefetch);
-  ir_call_2(ir, sq_prefetch, data, addr);
-  ir_label(ir, skip);
-
-  ir_set_current_block(ir, skip_block);
+  ir_call_cond_2(ir, cond, sq_prefetch, data, addr);
 }
 
 // RTE
@@ -1556,7 +1509,7 @@ EMITTER(RTE) {
       ir_load_context(ir, offsetof(struct sh4_ctx, ssr), VALUE_I32);
   store_sr(ssr);
   emit_delay_instr();
-  branch(spc);
+  unit->branch_dest = spc;
 }
 
 // SETS
@@ -1762,7 +1715,9 @@ EMITTER(STSMPR) {
 
 // TRAPA   #imm
 EMITTER(TRAPA) {
-  LOG_FATAL("TRAPA not implemented");
+  /* FIXME */
+  ir_debug_break(ir);
+  unit->branch_dest = ir_alloc_i32(ir, 0);
 }
 
 // FLDI0  FRn 1111nnnn10001101

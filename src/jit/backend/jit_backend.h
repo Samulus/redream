@@ -7,6 +7,7 @@ struct address_space;
 struct exception;
 struct ir;
 struct jit;
+struct jit_code;
 
 struct jit_register {
   const char *name;
@@ -21,7 +22,7 @@ struct jit_backend {
   int num_registers;
 
   void (*reset)(struct jit_backend *base);
-  void *(*assemble_code)(struct jit_backend *base, struct ir *ir, int *size);
+  int (*assemble_code)(struct jit_backend *base, struct jit_code *code, struct ir *ir);
   void (*dump_code)(struct jit_backend *base, const uint8_t *code, int size);
 
   int (*handle_exception)(struct jit_backend *base, struct exception *ex);

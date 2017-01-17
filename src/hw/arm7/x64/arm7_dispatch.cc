@@ -127,7 +127,7 @@ void arm7_dispatch_init(void *sh4, void *jit, void *ctx, void *mem) {
 
     e.mov(arg0, (uint64_t)jit);
     e.mov(arg1, e.dword[e.r14 + offsetof(struct armv3_context, r[15])]);
-    e.call(&jit_compile_block);
+    e.call(&jit_compile_code);
     e.jmp(arm7_dispatch_dynamic);
   }
 

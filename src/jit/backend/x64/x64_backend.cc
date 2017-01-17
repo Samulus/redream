@@ -388,12 +388,6 @@ static void x64_backend_block_label(char *name, size_t size,
   snprintf(name, size, ".%p", block);
 }
 
-static void x64_backend_label_name(char *name, size_t size,
-                                   struct ir_value *v) {
-  /* all ir labels are local labels */
-  snprintf(name, size, ".%s", v->str);
-}
-
 static int x64_backend_can_encode_imm(const struct ir_value *v) {
   if (!ir_is_constant(v)) {
     return 0;
@@ -610,7 +604,7 @@ static void x64_backend_dump_code(struct jit_backend *base, const uint8_t *code,
   struct x64_backend *backend = container_of(base, struct x64_backend, base);
 
   cs_insn *insns;
-  size_t count = cs_disasm(backend->capstone_handle, code, size, 0, 0, &insns);
+  size_t count = cs_disasm(backend->capstone_handle, code, size, (uintptr_t)code, 0, &insns);
   CHECK(count);
 
   for (size_t i = 0; i < count; i++) {
@@ -622,27 +616,26 @@ static void x64_backend_dump_code(struct jit_backend *base, const uint8_t *code,
   cs_free(insns, count);
 }
 
-static void *x64_backend_assemble_code(struct jit_backend *base, struct ir *ir,
-                                       int *size) {
+static int x64_backend_assemble_code(struct jit_backend *base, struct jit_code *code, struct ir *ir) {
   PROF_ENTER("cpu", "x64_backend_assemble_code");
 
   struct x64_backend *backend = container_of(base, struct x64_backend, base);
+  int res = 1;
 
   /* try to generate the x64 code. if the code buffer overflows let the backend
      know so it can reset the cache and try again */
-  void *code = NULL;
-
   try {
-    code = x64_backend_emit(backend, ir, size);
+    code->host_addr = x64_backend_emit(backend, ir, &code->host_size);
   } catch (const Xbyak::Error &e) {
     if (e != Xbyak::ERR_CODE_IS_TOO_BIG) {
       LOG_FATAL("X64 codegen failure, %s", e.what());
     }
+    res = 0;
   }
 
   PROF_LEAVE();
 
-  return code;
+  return res;
 }
 
 static void x64_backend_reset(struct jit_backend *base) {
@@ -1527,20 +1520,10 @@ EMITTER(LSHD) {
   e.outLocalLabel();
 }
 
-EMITTER(LABEL) {
-  char name[128];
-  x64_backend_label_name(name, sizeof(name), instr->arg[0]);
-  e.L(name);
-}
-
 EMITTER(BRANCH) {
   if (instr->arg[0]->type == VALUE_BLOCK) {
     char name[128];
     x64_backend_block_label(name, sizeof(name), instr->arg[0]->blk);
-    e.jmp(name, Xbyak::CodeGenerator::T_NEAR);
-  } else if (instr->arg[0]->type == VALUE_STRING) {
-    char name[128];
-    x64_backend_label_name(name, sizeof(name), instr->arg[0]);
     e.jmp(name, Xbyak::CodeGenerator::T_NEAR);
   } else {
     void *dst = (void *)instr->arg[0]->i64;
@@ -1548,45 +1531,76 @@ EMITTER(BRANCH) {
   }
 }
 
-EMITTER(BRANCH_FALSE) {
-  const Xbyak::Reg cond = x64_backend_reg(backend, instr->arg[1]);
-
-  e.test(cond, cond);
-
-  if (instr->arg[0]->type == VALUE_BLOCK) {
-    char name[128];
-    x64_backend_block_label(name, sizeof(name), instr->arg[0]->blk);
-    e.jnz(name, Xbyak::CodeGenerator::T_NEAR);
-  } else if (instr->arg[0]->type == VALUE_STRING) {
-    char name[128];
-    x64_backend_label_name(name, sizeof(name), instr->arg[0]);
-    e.jz(name);
-  } else {
-    void *dst = (void *)instr->arg[0]->i64;
-    e.jz(dst);
-  }
-}
-
 EMITTER(BRANCH_TRUE) {
-  const Xbyak::Reg cond = x64_backend_reg(backend, instr->arg[1]);
+  const Xbyak::Reg cond = x64_backend_reg(backend, instr->arg[0]);
 
   e.test(cond, cond);
 
-  if (instr->arg[0]->type == VALUE_BLOCK) {
+  if (instr->arg[1]->type == VALUE_BLOCK) {
     char name[128];
-    x64_backend_block_label(name, sizeof(name), instr->arg[0]->blk);
-    e.jz(name, Xbyak::CodeGenerator::T_NEAR);
-  } else if (instr->arg[0]->type == VALUE_STRING) {
-    char name[128];
-    x64_backend_label_name(name, sizeof(name), instr->arg[0]);
-    e.jz(name, Xbyak::CodeGenerator::T_NEAR);
+    x64_backend_block_label(name, sizeof(name), instr->arg[1]->blk);
+    e.jnz(name, Xbyak::CodeGenerator::T_NEAR);
   } else {
-    void *dst = (void *)instr->arg[0]->i64;
+    void *dst = (void *)instr->arg[1]->i64;
     e.jnz(dst);
   }
 }
 
+EMITTER(BRANCH_FALSE) {
+  const Xbyak::Reg cond = x64_backend_reg(backend, instr->arg[0]);
+
+  e.test(cond, cond);
+
+  if (instr->arg[1]->type == VALUE_BLOCK) {
+    char name[128];
+    x64_backend_block_label(name, sizeof(name), instr->arg[1]->blk);
+    e.jz(name, Xbyak::CodeGenerator::T_NEAR);
+  } else {
+    void *dst = (void *)instr->arg[1]->i64;
+    e.jz(dst);
+  }
+}
+
 EMITTER(CALL) {
+  if (instr->arg[1]) {
+    x64_backend_mov_value(backend, arg0, instr->arg[1]);
+  }
+  if (instr->arg[2]) {
+    x64_backend_mov_value(backend, arg1, instr->arg[2]);
+  }
+
+  if (ir_is_constant(instr->arg[0])) {
+    e.call((void *)instr->arg[0]->i64);
+  } else {
+    const Xbyak::Reg addr = x64_backend_reg(backend, instr->arg[0]);
+    e.call(addr);
+  }
+}
+
+EMITTER(CALL_COND) {
+  const Xbyak::Reg cond = x64_backend_reg(backend, instr->arg[0]);
+
+  if (instr->arg[2]) {
+    x64_backend_mov_value(backend, arg0, instr->arg[2]);
+  }
+  if (instr->arg[3]) {
+    x64_backend_mov_value(backend, arg1, instr->arg[3]);
+  }
+
+  e.inLocalLabel();
+  e.test(cond, cond);
+  e.jz(".skip");
+  if (ir_is_constant(instr->arg[1])) {
+    e.call((void *)instr->arg[1]->i64);
+  } else {
+    const Xbyak::Reg addr = x64_backend_reg(backend, instr->arg[1]);
+    e.call(addr);
+  }
+  e.L(".skip");
+  e.outLocalLabel();
+}
+
+EMITTER(CALL_NORETURN) {
   if (instr->arg[1]) {
     x64_backend_mov_value(backend, arg0, instr->arg[1]);
   }

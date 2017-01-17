@@ -21,47 +21,12 @@
 
 DEFINE_OPTION_INT(perf, 0, "Generate perf-compatible maps for genrated code");
 
-struct jit_block {
-  /* address of source block in guest memory */
-  uint32_t guest_addr;
-
-  /* address of compiled block in host memory */
-  void *host_addr;
-  int host_size;
-
-  /* compile with fastmem support */
-  int fastmem;
-
-  /* edges to other blocks */
-  struct list in_edges;
-  struct list out_edges;
-
-  /* lookup map iterators */
-  struct rb_node it;
-  struct rb_node rit;
-};
-
-struct jit_edge {
-  struct jit_block *src;
-  struct jit_block *dst;
-
-  /* location of branch instruction in host memory */
-  void *branch;
-
-  /* has this branch been patched */
-  int patched;
-
-  /* iterators for edge lists */
-  struct list_node in_it;
-  struct list_node out_it;
-};
-
-static int block_map_cmp(const struct rb_node *rb_lhs,
+static int meta_map_cmp(const struct rb_node *rb_lhs,
                          const struct rb_node *rb_rhs) {
-  const struct jit_block *lhs =
-      container_of(rb_lhs, const struct jit_block, it);
-  const struct jit_block *rhs =
-      container_of(rb_rhs, const struct jit_block, it);
+  const struct jit_block_meta *lhs =
+      container_of(rb_lhs, const struct jit_block_meta, it);
+  const struct jit_block_meta *rhs =
+      container_of(rb_rhs, const struct jit_block_meta, it);
 
   if (lhs->guest_addr < rhs->guest_addr) {
     return -1;
@@ -72,12 +37,28 @@ static int block_map_cmp(const struct rb_node *rb_lhs,
   }
 }
 
-static int reverse_block_map_cmp(const struct rb_node *rb_lhs,
+static int code_map_cmp(const struct rb_node *rb_lhs,
+                         const struct rb_node *rb_rhs) {
+  const struct jit_code *lhs =
+      container_of(rb_lhs, const struct jit_code, it);
+  const struct jit_code *rhs =
+      container_of(rb_rhs, const struct jit_code, it);
+
+  if (lhs->guest_addr < rhs->guest_addr) {
+    return -1;
+  } else if (lhs->guest_addr > rhs->guest_addr) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+static int code_reverse_map_cmp(const struct rb_node *rb_lhs,
                                  const struct rb_node *rb_rhs) {
-  const struct jit_block *lhs =
-      container_of(rb_lhs, const struct jit_block, rit);
-  const struct jit_block *rhs =
-      container_of(rb_rhs, const struct jit_block, rit);
+  const struct jit_code *lhs =
+      container_of(rb_lhs, const struct jit_code, rit);
+  const struct jit_code *rhs =
+      container_of(rb_rhs, const struct jit_code, rit);
 
   if ((uint8_t *)lhs->host_addr < (uint8_t *)rhs->host_addr) {
     return -1;
@@ -88,31 +69,45 @@ static int reverse_block_map_cmp(const struct rb_node *rb_lhs,
   }
 }
 
-static struct rb_callbacks block_map_cb = {
-    &block_map_cmp, NULL, NULL,
+static struct rb_callbacks meta_map_cb = {
+    &meta_map_cmp, NULL, NULL,
 };
 
-static struct rb_callbacks reverse_block_map_cb = {
-    &reverse_block_map_cmp, NULL, NULL,
+static struct rb_callbacks code_map_cb = {
+    &code_map_cmp, NULL, NULL,
 };
 
-static struct jit_block *jit_get_block(struct jit *jit, uint32_t guest_addr) {
-  struct jit_block search;
+static struct rb_callbacks code_reverse_map_cb = {
+    &code_reverse_map_cmp, NULL, NULL,
+};
+
+static struct jit_block_meta *jit_lookup_meta(struct jit *jit, uint32_t guest_addr) {
+  struct jit_block_meta search;
   search.guest_addr = guest_addr;
 
-  return rb_find_entry(&jit->blocks, &search, struct jit_block, it,
-                       &block_map_cb);
+  return rb_find_entry(&jit->meta, &search, struct jit_block_meta, it,
+                       &meta_map_cb);
 }
 
-static struct jit_block *jit_lookup_block_reverse(struct jit *jit,
+static struct jit_code *jit_lookup_code(struct jit *jit, uint32_t guest_addr) {
+  struct jit_code search;
+  search.guest_addr = guest_addr;
+
+  return rb_find_entry(&jit->code, &search, struct jit_code, it,
+                       &code_map_cb);
+}
+
+static struct jit_code *jit_lookup_code_reverse(struct jit *jit,
                                                   void *host_addr) {
-  struct jit_block search;
+  /* when performing a reverse lookup, host_addr represents an address
+     somewhere within a block, not necessarily the start of the block */
+  struct jit_code search;
   search.host_addr = host_addr;
 
-  struct rb_node *first = rb_first(&jit->reverse_blocks);
-  struct rb_node *last = rb_last(&jit->reverse_blocks);
+  struct rb_node *first = rb_first(&jit->code_reverse);
+  struct rb_node *last = rb_last(&jit->code_reverse);
   struct rb_node *rit =
-      rb_upper_bound(&jit->reverse_blocks, &search.rit, &reverse_block_map_cb);
+      rb_upper_bound(&jit->code_reverse, &search.rit, &code_reverse_map_cb);
 
   if (rit == first) {
     return NULL;
@@ -120,35 +115,35 @@ static struct jit_block *jit_lookup_block_reverse(struct jit *jit,
 
   rit = rit ? rb_prev(rit) : last;
 
-  struct jit_block *block = container_of(rit, struct jit_block, rit);
-  if ((uint8_t *)host_addr < (uint8_t *)block->host_addr ||
+  struct jit_code *code = container_of(rit, struct jit_code, rit);
+  if ((uint8_t *)host_addr < (uint8_t *)code->host_addr ||
       (uint8_t *)host_addr >=
-          ((uint8_t *)block->host_addr + block->host_size)) {
+          ((uint8_t *)code->host_addr + code->host_size)) {
     return NULL;
   }
 
-  return block;
+  return code;
 }
 
-static int jit_is_stale(struct jit *jit, struct jit_block *block) {
-  void *code = jit->guest->lookup_code(block->guest_addr);
-  return code != block->host_addr;
+static int jit_is_stale(struct jit *jit, struct jit_code *code) {
+  void *ptr = jit->guest->lookup_code(code->guest_addr);
+  return ptr != code->host_addr;
 }
 
-static void jit_patch_edges(struct jit *jit, struct jit_block *block) {
+static void jit_patch_edges(struct jit *jit, struct jit_code *code) {
   PROF_ENTER("cpu", "jit_patch_edges");
 
   /* patch incoming edges to this block to directly jump to it instead of
      going through dispatch */
-  list_for_each_entry(edge, &block->in_edges, struct jit_edge, in_it) {
+  list_for_each_entry(edge, &code->in_edges, struct jit_edge, in_it) {
     if (!edge->patched) {
       edge->patched = 1;
       jit->guest->patch_edge(edge->branch, edge->dst->host_addr);
     }
   }
 
-  /* patch outgoing edges to other blocks at this time */
-  list_for_each_entry(edge, &block->out_edges, struct jit_edge, out_it) {
+  /* patch outgoing edges to other code at this time */
+  list_for_each_entry(edge, &code->out_edges, struct jit_edge, out_it) {
     if (!edge->patched) {
       edge->patched = 1;
       jit->guest->patch_edge(edge->branch, edge->dst->host_addr);
@@ -158,11 +153,11 @@ static void jit_patch_edges(struct jit *jit, struct jit_block *block) {
   PROF_LEAVE();
 }
 
-static void jit_restore_edges(struct jit *jit, struct jit_block *block) {
+static void jit_restore_edges(struct jit *jit, struct jit_code *code) {
   PROF_ENTER("cpu", "jit_restore_edges");
 
   /* restore any patched branches to go back through dispatch */
-  list_for_each_entry(edge, &block->in_edges, struct jit_edge, in_it) {
+  list_for_each_entry(edge, &code->in_edges, struct jit_edge, in_it) {
     if (edge->patched) {
       edge->patched = 0;
       jit->guest->restore_edge(edge->branch, edge->dst->guest_addr);
@@ -172,95 +167,129 @@ static void jit_restore_edges(struct jit *jit, struct jit_block *block) {
   PROF_LEAVE();
 }
 
-static void jit_invalidate_block(struct jit *jit, struct jit_block *block) {
-  jit->guest->invalidate_code(block->guest_addr);
+static void jit_finalize_code(struct jit *jit, struct jit_code *code) {
+  CHECK(list_empty(&code->in_edges) && list_empty(&code->out_edges), "code shouldn't have any existing edges");
+  CHECK(rb_empty_node(&code->it) && rb_empty_node(&code->rit), "code was already inserted in ldokup tables");
 
-  jit_restore_edges(jit, block);
+  jit->guest->cache_code(code->guest_addr, code->host_addr);
 
-  list_for_each_entry_safe(edge, &block->in_edges, struct jit_edge, in_it) {
+  rb_insert(&jit->code, &code->it, &code_map_cb);
+  rb_insert(&jit->code_reverse, &code->rit, &code_reverse_map_cb);
+
+  /* write out to perf map if enabled */
+  if (OPTION_perf) {
+    fprintf(jit->perf_map, "%" PRIxPTR " %x %s_0x%08x\n",
+            (uintptr_t)code->host_addr, code->host_size, jit->tag, code->guest_addr);
+  }
+}
+
+static void jit_free_compile_unit(struct jit *jit, struct jit_compile_unit **unit_ptr) {
+  struct jit_compile_unit *unit = *unit_ptr;
+
+  if (!unit) {
+    return;
+  }
+
+  jit_free_compile_unit(jit, &unit->branch);
+  jit_free_compile_unit(jit, &unit->next);
+
+  list_remove(&unit->meta->compile_refs, &unit->meta_it);
+  free(unit);
+  *unit_ptr = NULL;
+}
+
+static void jit_invalidate_code(struct jit *jit, struct jit_code *code) {
+  /* FIXME */
+  jit_free_compile_unit(jit, &code->root_unit);
+
+  /* invalid code from guest dispatch cache and remove any direct branches
+     to this code */
+  jit->guest->invalidate_code(code->guest_addr);
+
+  jit_restore_edges(jit, code);
+
+  list_for_each_entry_safe(edge, &code->in_edges, struct jit_edge, in_it) {
     list_remove(&edge->src->out_edges, &edge->out_it);
-    list_remove(&block->in_edges, &edge->in_it);
+    list_remove(&code->in_edges, &edge->in_it);
     free(edge);
   }
 
-  list_for_each_entry_safe(edge, &block->out_edges, struct jit_edge, out_it) {
-    list_remove(&block->out_edges, &edge->out_it);
+  list_for_each_entry_safe(edge, &code->out_edges, struct jit_edge, out_it) {
+    list_remove(&code->out_edges, &edge->out_it);
     list_remove(&edge->dst->in_edges, &edge->in_it);
     free(edge);
   }
 }
 
-static void jit_cache_block(struct jit *jit, struct jit_block *block) {
-  jit->guest->cache_code(block->guest_addr, block->host_addr);
+static void jit_free_code(struct jit *jit, struct jit_code *code) {
+  jit_invalidate_code(jit, code);
 
-  CHECK(list_empty(&block->in_edges));
-  CHECK(list_empty(&block->out_edges));
-}
-
-static void jit_free_block(struct jit *jit, struct jit_block *block) {
-  jit_invalidate_block(jit, block);
-
-  rb_unlink(&jit->blocks, &block->it, &block_map_cb);
-  rb_unlink(&jit->reverse_blocks, &block->rit, &reverse_block_map_cb);
-
-  free(block);
-}
-
-static struct jit_block *jit_alloc_block(struct jit *jit, uint32_t guest_addr,
-                                         void *host_addr, int host_size,
-                                         int fastmem) {
-  struct jit_block *block = calloc(1, sizeof(struct jit_block));
-  block->guest_addr = guest_addr;
-  block->host_addr = host_addr;
-  block->host_size = host_size;
-  block->fastmem = fastmem;
-
-  rb_insert(&jit->blocks, &block->it, &block_map_cb);
-  rb_insert(&jit->reverse_blocks, &block->rit, &reverse_block_map_cb);
-
-  jit_cache_block(jit, block);
-
-  return block;
-}
-
-void jit_free_blocks(struct jit *jit) {
-  /* invalidate code pointers and remove block entries from lookup maps. this
-     is only safe to use when no code is currently executing */
-  struct rb_node *it = rb_first(&jit->blocks);
-
-  while (it) {
-    struct rb_node *next = rb_next(it);
-
-    struct jit_block *block = container_of(it, struct jit_block, it);
-    jit_free_block(jit, block);
-
-    it = next;
+  if (!rb_empty_node(&code->it)) {
+    rb_unlink(&jit->code, &code->it, &code_map_cb);
+  }
+  if (!rb_empty_node(&code->rit)) {
+    rb_unlink(&jit->code_reverse, &code->rit, &code_reverse_map_cb);
   }
 
-  /* have the backend reset its code buffers */
-  jit->backend->reset(jit->backend);
+  free(code);
 }
 
-void jit_invalidate_blocks(struct jit *jit) {
-  /* invalidate code pointers, but don't remove block entries from lookup maps.
-     this is used when clearing the jit while code is currently executing */
-  struct rb_node *it = rb_first(&jit->blocks);
+static struct jit_code *jit_alloc_code(struct jit *jit) {
+  struct jit_code *code = calloc(1, sizeof(struct jit_code));
 
-  while (it) {
-    struct rb_node *next = rb_next(it);
+  return code;
+}
 
-    struct jit_block *block = container_of(it, struct jit_block, it);
-    jit_invalidate_block(jit, block);
+static void jit_free_meta(struct jit *jit, struct jit_block_meta *meta) {
+  /* FIXME */
+  CHECK(list_empty(&meta->compile_refs), "code most be freed before meta data");
 
-    it = next;
+  rb_unlink(&jit->meta, &meta->it, &meta_map_cb);
+
+  free(meta);
+}
+
+static struct jit_block_meta *jit_alloc_meta(struct jit *jit, uint32_t addr) {
+  struct jit_block_meta *meta = calloc(1, sizeof(struct jit_block_meta));
+  meta->guest_addr = addr;
+  meta->branch_addr = INVALID_ADDR;
+  meta->next_addr = INVALID_ADDR;
+
+  rb_insert(&jit->meta, &meta->it, &meta_map_cb);
+
+  return meta;
+}
+
+/* invalidate code pointers, but don't remove code entries from lookup maps.
+   this is used when clearing the jit while code is currently executing */
+void jit_invalidate_cache(struct jit *jit) {
+  /* FIXME */
+  rb_for_each_entry_safe(code, &jit->code, struct jit_code, it) {
+    jit_invalidate_code(jit, code);
   }
 
-  /* don't reset backend code buffers, code is still running */
+  rb_for_each_entry_safe(meta, &jit->meta, struct jit_block_meta, it) {
+    jit_free_meta(jit, meta);
+  }
+  CHECK(rb_empty_tree(&jit->meta));
+}
+
+ /* invalidate code pointers and remove code entries from lookup maps. this
+    is only safe to use when no code is currently executing */
+void jit_free_cache(struct jit *jit) {
+  /* FIXME */
+  jit_invalidate_cache(jit);
+
+  rb_for_each_entry_safe(code, &jit->code, struct jit_code, it) {
+    jit_free_code(jit, code);
+  }
+  CHECK(rb_empty_tree(&jit->code));
+  CHECK(rb_empty_tree(&jit->code_reverse));
 }
 
 void jit_add_edge(struct jit *jit, void *branch, uint32_t addr) {
-  struct jit_block *src = jit_lookup_block_reverse(jit, branch);
-  struct jit_block *dst = jit_get_block(jit, addr);
+  struct jit_code *src = jit_lookup_code_reverse(jit, branch);
+  struct jit_code *dst = jit_lookup_code(jit, addr);
 
   if (jit_is_stale(jit, src) || !dst) {
     return;
@@ -276,7 +305,7 @@ void jit_add_edge(struct jit *jit, void *branch, uint32_t addr) {
   jit_patch_edges(jit, src);
 }
 
-static void jit_dump_block(struct jit *jit, uint32_t guest_addr,
+static void jit_dump_code(struct jit *jit, uint32_t guest_addr,
                            struct ir *ir) {
   const char *appdir = fs_appdir();
 
@@ -294,11 +323,55 @@ static void jit_dump_block(struct jit *jit, uint32_t guest_addr,
   fclose(file);
 }
 
-void jit_compile_block(struct jit *jit, uint32_t guest_addr) {
-  PROF_ENTER("cpu", "jit_compile_block");
+static struct jit_compile_unit *jit_analyze_code_r(struct jit *jit, struct jit_code *code, uint32_t guest_addr) {
+  struct jit_block_meta *meta = jit_lookup_meta(jit, guest_addr);
 
-#if 0
-  LOG_INFO("jit_compile_block %s 0x%08x", jit->tag, guest_addr);
+  /* don't allow control flow to rejoin */
+  if (meta && meta->visited == jit->visit_token) {
+    return NULL;
+  }
+
+  /* FIXME cleanup */
+  if (!meta) {
+    meta = jit_alloc_meta(jit, guest_addr);
+
+    /* analyze fails currently during bootstrap when a branch is found, but the
+       code actually hasn't been written out to memory just yet */
+    if (!jit->frontend->analyze_code(jit->frontend, meta)) {
+      jit_free_meta(jit, meta);
+      return NULL;
+    }
+  }
+
+  meta->visited = jit->visit_token;
+
+  struct jit_compile_unit *unit = calloc(1, sizeof(struct jit_compile_unit));
+  unit->parent = code;
+  unit->meta = meta;
+  list_add(&meta->compile_refs, &unit->meta_it);
+
+  if (meta->branch_addr != INVALID_ADDR) {
+    unit->branch = jit_analyze_code_r(jit, code, meta->branch_addr);
+  }
+
+  if (meta->next_addr != INVALID_ADDR) {
+    unit->next = jit_analyze_code_r(jit, code, meta->next_addr);
+  }
+
+  return unit;
+}
+
+static void jit_analyze_code(struct jit *jit, struct jit_code *code) {
+  jit->visit_token++;
+  code->root_unit = jit_analyze_code_r(jit, code, code->guest_addr);
+  CHECK_NOTNULL(code->root_unit);
+}
+
+void jit_compile_code(struct jit *jit, uint32_t guest_addr) {
+  PROF_ENTER("cpu", "jit_compile_code");
+
+#if 1
+  LOG_INFO("jit_compile_code %s 0x%08x", jit->tag, guest_addr);
 #endif
 
   /* for debug builds, fastmem can be troublesome when running under gdb or
@@ -315,27 +388,37 @@ void jit_compile_block(struct jit *jit, uint32_t guest_addr) {
   fastmem = 0;
 #endif
 
-  /* if the block being compiled had previously been invalidated by a fastmem
-     exception, finish removing it at this time and disable fastmem opts */
-  struct jit_block *existing = jit_get_block(jit, guest_addr);
+  /* if the address being compiled had previously been invalidated by a fastmem
+     exception, finish freeing it at this time and disable fastmem opts for the
+     new block */
+  struct jit_code *existing = jit_lookup_code(jit, guest_addr);
+
   if (existing) {
     fastmem = existing->fastmem;
-    jit_free_block(jit, existing);
+    jit_free_code(jit, existing);
   }
+
+  /* create the new code entry */
+  struct jit_code *code = jit_alloc_code(jit);
+  code->guest_addr = guest_addr;
+  code->fastmem = fastmem;
+
+  /* analyze the guest address, adding translion units to the new code entry */
+  jit_analyze_code(jit, code);
 
   /* translate the source machine code into ir */
   struct ir ir = {0};
   ir.buffer = jit->ir_buffer;
   ir.capacity = sizeof(jit->ir_buffer);
 
-  int guest_size;
-  jit->frontend->translate_code(jit->frontend, guest_addr, &ir, fastmem,
-                                &guest_size);
+  jit->frontend->translate_code(jit->frontend, code, &ir);
 
   /* dump unoptimized block */
-  if (jit->dump_blocks) {
-    jit_dump_block(jit, guest_addr, &ir);
+  if (jit->dump_code) {
+    jit_dump_code(jit, guest_addr, &ir);
   }
+
+  //ir_write(&ir, stdout);
 
   /* run optimization passes */
   cfa_run(jit->cfa, &ir);
@@ -346,24 +429,15 @@ void jit_compile_block(struct jit *jit, uint32_t guest_addr) {
   ra_run(jit->ra, &ir);
 
   /* assemble the ir into native code */
-  int host_size = 0;
-  uint8_t *host_addr =
-      jit->backend->assemble_code(jit->backend, &ir, &host_size);
+  int res = jit->backend->assemble_code(jit->backend, code, &ir);
 
-  if (host_addr) {
-    /* cache the compiled code */
-    struct jit_block *block =
-        jit_alloc_block(jit, guest_addr, host_addr, host_size, fastmem);
-
-    if (OPTION_perf) {
-      fprintf(jit->perf_map, "%" PRIxPTR " %x %s_0x%08x\n",
-              (uintptr_t)host_addr, host_size, jit->tag, guest_addr);
-    }
+  if (res) {
+    jit_finalize_code(jit, code);
   } else {
     /* if the backend overflowed, completely free the cache and let dispatch
        try to compile again */
     LOG_INFO("backend overflow, resetting code cache");
-    jit_free_blocks(jit);
+    jit_free_cache(jit);
   }
 
   PROF_LEAVE();
@@ -373,9 +447,9 @@ static int jit_handle_exception(void *data, struct exception *ex) {
   struct jit *jit = data;
 
   /* see if there is a cached block corresponding to the current pc */
-  struct jit_block *block = jit_lookup_block_reverse(jit, (void *)ex->pc);
+  struct jit_code *code = jit_lookup_code_reverse(jit, (void *)ex->pc);
 
-  if (!block) {
+  if (!code) {
     return 0;
   }
 
@@ -388,8 +462,8 @@ static int jit_handle_exception(void *data, struct exception *ex) {
      on the next access. note, the block can't be removed from the lookup
      maps at this point because it's still executing and may raise more
      exceptions */
-  block->fastmem = 0;
-  jit_invalidate_block(jit, block);
+  code->fastmem = 0;
+  jit_invalidate_code(jit, code);
 
   return 1;
 }
@@ -453,7 +527,7 @@ void jit_destroy(struct jit *jit) {
   }
 
   if (jit->backend) {
-    jit_free_blocks(jit);
+    jit_free_cache(jit);
   }
 
   free(jit);

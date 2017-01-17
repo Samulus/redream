@@ -13,7 +13,6 @@
 #include "hw/scheduler.h"
 #include "hw/sh4/x64/sh4_dispatch.h"
 #include "jit/backend/x64/x64_backend.h"
-#include "jit/frontend/sh4/sh4_analyze.h"
 #include "jit/frontend/sh4/sh4_disasm.h"
 #include "jit/frontend/sh4/sh4_frontend.h"
 #include "jit/frontend/sh4/sh4_translate.h"
@@ -103,62 +102,65 @@ static void sh4_reg_write(struct sh4 *sh4, uint32_t addr, uint32_t data,
   sh4->reg[offset] = data;
 }
 
-static void sh4_translate(void *data, uint32_t addr, struct ir *ir, int fastmem,
-                          int *size) {
-  struct sh4 *sh4 = data;
+static struct ir_block *sh4_demand_block(struct ir *ir, uint32_t addr) {
+  char label[MAX_LABEL_SIZE];
+  snprintf(label, sizeof(label), "0x%08x", addr);
 
-  /* analyze the guest block to get its size, cycle count, etc. */
-  struct sh4_analysis as = {0};
-  as.addr = addr;
-  if (fastmem) {
-    as.flags |= SH4_FASTMEM;
+  list_for_each_entry(block, &ir->blocks, struct ir_block, it) {
+    if (block->label && !strcmp(block->label, label)) {
+      return block;
+    }
   }
-  if (sh4->ctx.fpscr & PR) {
-    as.flags |= SH4_DOUBLE_PR;
-  }
-  if (sh4->ctx.fpscr & SZ) {
-    as.flags |= SH4_DOUBLE_SZ;
-  }
-  sh4_analyze_block(sh4->jit, &as);
 
-  /* return the size */
-  *size = as.size;
+  struct ir_block *block = ir_append_block(ir);
+  ir_set_block_label(ir, block, label);
+  return block;
+}
 
-  /* yield control once remaining cycles are executed */
-  struct ir_value *remaining_cycles = ir_load_context(
-      ir, offsetof(struct sh4_ctx, remaining_cycles), VALUE_I32);
-  struct ir_value *done = ir_cmp_sle(ir, remaining_cycles, ir_alloc_i32(ir, 0));
-  ir_branch_true(ir, ir_alloc_ptr(ir, sh4_dispatch_leave), done);
+static struct ir_value *sh4_static_branch_thunk(struct ir *ir, uint32_t addr) {
+  struct ir_insert_point point = ir_get_insert_point(ir);
 
-  /* handle pending interrupts */
-  struct ir_value *pending_intr = ir_load_context(
-      ir, offsetof(struct sh4_ctx, pending_interrupts), VALUE_I64);
-  ir_branch_true(ir, ir_alloc_ptr(ir, sh4_dispatch_interrupt), pending_intr);
+  struct ir_block *thunk_block = ir_append_block(ir);
+  ir_set_current_block(ir, thunk_block);
+  ir_store_context(ir, offsetof(struct sh4_ctx, pc), ir_alloc_i32(ir, addr));
+  ir_call_noreturn(ir, ir_alloc_ptr(ir, sh4_dispatch_static));
+
+  ir_set_insert_point(ir, &point);
+
+  return ir_alloc_block(ir, thunk_block);
+}
+
+static void sh4_translate_r(struct sh4 *sh4, struct ir *ir, int flags, struct jit_compile_unit *unit) {
+  struct jit_block_meta *meta = unit->meta;
+
+  //LOG_INFO("sh4_translate_r 0x%08x : 0x%08x : 0x%08x", meta->guest_addr, meta->branch_addr, meta->next_addr);
 
   /* update remaining cycles */
-  remaining_cycles = ir_sub(ir, remaining_cycles, ir_alloc_i32(ir, as.cycles));
+  struct ir_value *remaining_cycles =
+      ir_load_context(ir, offsetof(struct sh4_ctx, remaining_cycles), VALUE_I32);
+  remaining_cycles = ir_sub(ir, remaining_cycles, ir_alloc_i32(ir, meta->num_cycles));
   ir_store_context(ir, offsetof(struct sh4_ctx, remaining_cycles),
                    remaining_cycles);
 
   /* update instruction run count */
   struct ir_value *ran_instrs =
       ir_load_context(ir, offsetof(struct sh4_ctx, ran_instrs), VALUE_I64);
-  ran_instrs = ir_add(ir, ran_instrs, ir_alloc_i64(ir, as.size / 2));
+  ran_instrs = ir_add(ir, ran_instrs, ir_alloc_i64(ir, meta->num_instrs));
   ir_store_context(ir, offsetof(struct sh4_ctx, ran_instrs), ran_instrs);
 
   /* translate the actual block */
-  for (int i = 0; i < as.size;) {
+  for (int i = 0; i < meta->size;) {
     struct sh4_instr instr = {0};
     struct sh4_instr delay_instr = {0};
 
-    instr.addr = addr + i;
+    instr.addr = meta->guest_addr + i;
     instr.opcode = as_read16(sh4->memory_if->space, instr.addr);
     sh4_disasm(&instr);
 
     i += 2;
 
     if (instr.flags & SH4_FLAG_DELAYED) {
-      delay_instr.addr = addr + i;
+      delay_instr.addr = meta->guest_addr + i;
       delay_instr.opcode = as_read16(sh4->memory_if->space, delay_instr.addr);
 
       /* instruction must be valid, breakpoints on delay instructions aren't
@@ -171,44 +173,133 @@ static void sh4_translate(void *data, uint32_t addr, struct ir *ir, int fastmem,
       i += 2;
     }
 
-    sh4_emit_instr(sh4->frontend, ir, as.flags, &instr, &delay_instr);
+    sh4_emit_instr(sh4->frontend, unit, ir, flags, &instr, &delay_instr);
   }
 
-  /* if the block terminates before a branch, fallthrough to the next pc */
-  struct ir_block *tail_block =
-      list_last_entry(&ir->blocks, struct ir_block, it);
-  struct ir_instr *tail_instr =
-      list_last_entry(&tail_block->instrs, struct ir_instr, it);
-
-  if (tail_instr->op != OP_STORE_CONTEXT ||
-      tail_instr->arg[0]->i32 != offsetof(struct sh4_ctx, pc)) {
-    ir_store_context(ir, offsetof(struct sh4_ctx, pc),
-                     ir_alloc_i32(ir, addr + as.size));
+  /* emit ir for branch */
+  if (unit->next) {
+    struct ir_block *next_block = sh4_demand_block(ir, meta->next_addr);
+    struct ir_insert_point point = ir_get_insert_point(ir);
+    ir_set_current_block(ir, next_block);
+    sh4_translate_r(sh4, ir, flags, unit->next);
+    ir_set_insert_point(ir, &point);
+  } else {
+    sh4_static_branch_thunk(ir, meta->next_addr);
   }
 
-  /* the default emitters won't actually insert calls / branches to the
-     appropriate dispatch routines (as how each is invoked is specific
-     to the particular dispatch backend) */
-  list_for_each_entry(block, &ir->blocks, struct ir_block, it) {
-    list_for_each_entry_safe_reverse(instr, &block->instrs, struct ir_instr,
-                                     it) {
-      if (instr->op != OP_STORE_CONTEXT ||
-          instr->arg[0]->i32 != offsetof(struct sh4_ctx, pc)) {
-        continue;
-      }
+  if (unit->branch) {
+    struct ir_block *branch_block = sh4_demand_block(ir, meta->branch_addr);
+    struct ir_insert_point point = ir_get_insert_point(ir);
+    ir_set_current_block(ir, branch_block);
+    sh4_translate_r(sh4, ir, flags, unit->branch);
+    ir_set_insert_point(ir, &point);
+  }
 
-      int direct = ir_is_constant(instr->arg[1]);
+  switch (meta->branch_type) {
+    case BRANCH_FALL_THROUGH: {
+      ir_store_context(ir, offsetof(struct sh4_ctx, pc), ir_alloc_i32(ir, meta->guest_addr + meta->size));
+      ir_branch(ir, ir_alloc_ptr(ir, sh4_dispatch_dynamic));
+    } break;
 
-      /* insert dispatch call immediately after pc store */
-      ir_set_current_instr(ir, instr);
-
-      if (direct) {
-        ir_call(ir, ir_alloc_ptr(ir, sh4_dispatch_static));
+    case BRANCH_STATIC: {
+      if (unit->branch) {
+        struct ir_block *branch_block = sh4_demand_block(ir, meta->branch_addr);
+        ir_branch(ir, ir_alloc_block(ir, branch_block));
       } else {
-        ir_branch(ir, ir_alloc_ptr(ir, sh4_dispatch_dynamic));
+        ir_store_context(ir, offsetof(struct sh4_ctx, pc), ir_alloc_i32(ir, meta->branch_addr));
+        ir_call_noreturn(ir, ir_alloc_ptr(ir, sh4_dispatch_static));
       }
-    }
+    } break;
+
+    case BRANCH_STATIC_TRUE: {
+      struct ir_value *branch_true;
+
+      if (unit->branch) {
+        branch_true = ir_alloc_block(ir, sh4_demand_block(ir, meta->branch_addr));
+      } else {
+        branch_true = sh4_static_branch_thunk(ir, meta->branch_addr);
+      }
+
+      ir_branch_true(ir, unit->branch_cond, branch_true);
+    } break;
+
+    case BRANCH_STATIC_FALSE: {
+      struct ir_value *branch_false;
+
+      if (unit->branch) {
+        branch_false = ir_alloc_block(ir, sh4_demand_block(ir, meta->branch_addr));
+      } else {
+        branch_false = sh4_static_branch_thunk(ir, meta->branch_addr);
+      }
+
+      ir_branch_false(ir, unit->branch_cond, branch_false);
+    } break;
+
+    case BRANCH_DYNAMIC: {
+      ir_store_context(ir, offsetof(struct sh4_ctx, pc), unit->branch_dest);
+      ir_branch(ir, ir_alloc_ptr(ir, sh4_dispatch_dynamic));
+    } break;
+
+    case BRANCH_DYNAMIC_TRUE: {
+      struct ir_value *branch_true;
+
+      CHECK(!unit->branch && unit->branch_dest);
+      branch_true = unit->branch_dest;
+
+      ir_branch_true(ir, unit->branch_cond, branch_true);
+    } break;
+
+    case BRANCH_DYNAMIC_FALSE: {
+      struct ir_value *branch_false;
+
+      CHECK(!unit->branch && unit->branch_dest);
+      branch_false = unit->branch_dest;
+
+      ir_branch_false(ir, unit->branch_cond, branch_false);
+    } break;
   }
+}
+
+static void sh4_translate(void *data, struct jit_code *code, struct ir *ir) {
+  struct sh4 *sh4 = data;
+
+#if 0
+  printf("sh4_translate 0x%08x", code->guest_addr);
+  for (int i = 0; i < 16; i++) {
+    printf(", r%d 0x%08x", i, sh4->ctx.r[i]);
+  }
+  printf("\n");
+#endif
+
+  int flags = 0;
+  if (code->fastmem) {
+    flags |= SH4_FASTMEM;
+  }
+  if (sh4->ctx.fpscr & PR) {
+    flags |= SH4_DOUBLE_PR;
+  }
+  if (sh4->ctx.fpscr & SZ) {
+    flags |= SH4_DOUBLE_SZ;
+  }
+
+  /* yield control once remaining cycles are executed */
+  struct ir_value *remaining_cycles = ir_load_context(
+      ir, offsetof(struct sh4_ctx, remaining_cycles), VALUE_I32);
+  struct ir_value *done = ir_cmp_sle(ir, remaining_cycles, ir_alloc_i32(ir, 0));
+  ir_branch_true(ir, done, ir_alloc_ptr(ir, sh4_dispatch_leave));
+
+  struct ir_block *skip_yield = ir_append_block(ir);
+  ir_set_current_block(ir, skip_yield);
+
+  /* handle pending interrupts */
+  struct ir_value *pending_intr = ir_load_context(
+      ir, offsetof(struct sh4_ctx, pending_interrupts), VALUE_I64);
+  ir_branch_true(ir, pending_intr, ir_alloc_ptr(ir, sh4_dispatch_interrupt));
+
+  struct ir_block *skip_interrupt_check = ir_append_block(ir);
+  ir_set_current_block(ir, skip_interrupt_check);
+
+  sh4_translate_r(sh4, ir, flags, code->root_unit);
 }
 
 void sh4_implode_sr(struct sh4 *sh4) {
@@ -240,18 +331,18 @@ static void sh4_debug_menu(struct device *dev, struct nk_context *ctx) {
     nk_layout_row_dynamic(ctx, DEBUG_MENU_HEIGHT, 1);
 
     if (nk_button_label(ctx, "clear cache")) {
-      jit_invalidate_blocks(sh4->jit);
+      jit_invalidate_cache(sh4->jit);
     }
 
     struct jit *jit = sh4->jit;
-    if (!jit->dump_blocks) {
+    if (!jit->dump_code) {
       if (nk_button_label(ctx, "start dumping blocks")) {
-        jit->dump_blocks = 1;
-        jit_invalidate_blocks(jit);
+        jit->dump_code = 1;
+        jit_invalidate_cache(jit);
       }
     } else {
       if (nk_button_label(ctx, "stop dumping blocks")) {
-        jit->dump_blocks = 0;
+        jit->dump_code = 0;
       }
     }
 
@@ -260,7 +351,7 @@ static void sh4_debug_menu(struct device *dev, struct nk_context *ctx) {
 }
 
 void sh4_reset(struct sh4 *sh4, uint32_t pc) {
-  jit_free_blocks(sh4->jit);
+  jit_free_cache(sh4->jit);
 
   /* reset context */
   memset(&sh4->ctx, 0, sizeof(sh4->ctx));

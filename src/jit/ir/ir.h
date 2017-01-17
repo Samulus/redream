@@ -6,7 +6,7 @@
 #include "core/list.h"
 
 #define MAX_LABEL_SIZE 128
-#define MAX_INSTR_ARGS 3
+#define MAX_INSTR_ARGS 4
 
 enum ir_op {
 #define IR_OP(name) OP_##name,
@@ -86,8 +86,6 @@ struct ir_value {
 
   /* generic meta data used by optimization passes */
   intptr_t tag;
-
-  void *interval;
 };
 
 struct ir_instr {
@@ -178,6 +176,7 @@ extern const char *ir_op_names[NUM_OPS];
 #define VALUE_VECTOR_MASK (VALUE_V128_MASK)
 #define VALUE_ALL_MASK (VALUE_INT_MASK | VALUE_FLOAT_MASK)
 
+#define INVALID_ADDR 0xffffffff
 #define NO_REGISTER -1
 
 static inline int ir_type_size(enum ir_type type) {
@@ -257,6 +256,7 @@ void ir_set_arg(struct ir *ir, struct ir_instr *instr, int n,
 void ir_set_arg0(struct ir *ir, struct ir_instr *instr, struct ir_value *v);
 void ir_set_arg1(struct ir *ir, struct ir_instr *instr, struct ir_value *v);
 void ir_set_arg2(struct ir *ir, struct ir_instr *instr, struct ir_value *v);
+void ir_set_arg3(struct ir *ir, struct ir_instr *instr, struct ir_value *v);
 
 void ir_replace_use(struct ir_use *use, struct ir_value *other);
 void ir_replace_uses(struct ir_value *v, struct ir_value *other);
@@ -382,14 +382,21 @@ struct ir_value *ir_lshd(struct ir *ir, struct ir_value *a, struct ir_value *n);
 /* branches */
 void ir_label(struct ir *ir, struct ir_value *lbl);
 void ir_branch(struct ir *ir, struct ir_value *dst);
-void ir_branch_false(struct ir *ir, struct ir_value *dst,
-                     struct ir_value *cond);
-void ir_branch_true(struct ir *ir, struct ir_value *dst, struct ir_value *cond);
+void ir_branch_true(struct ir *ir, struct ir_value *cond, struct ir_value *dst);
+void ir_branch_false(struct ir *ir, struct ir_value *cond, struct ir_value *dst);
 
 /* calls */
 void ir_call(struct ir *ir, struct ir_value *fn);
 void ir_call_1(struct ir *ir, struct ir_value *fn, struct ir_value *arg0);
 void ir_call_2(struct ir *ir, struct ir_value *fn, struct ir_value *arg0,
+               struct ir_value *arg1);
+void ir_call_cond(struct ir *ir, struct ir_value *cond, struct ir_value *fn);
+void ir_call_cond_1(struct ir *ir, struct ir_value *cond, struct ir_value *fn, struct ir_value *arg0);
+void ir_call_cond_2(struct ir *ir, struct ir_value *cond, struct ir_value *fn, struct ir_value *arg0,
+               struct ir_value *arg1);
+void ir_call_noreturn(struct ir *ir, struct ir_value *fn);
+void ir_call_noreturn_1(struct ir *ir, struct ir_value *fn, struct ir_value *arg0);
+void ir_call_noreturn_2(struct ir *ir, struct ir_value *fn, struct ir_value *arg0,
                struct ir_value *arg1);
 void ir_call_fallback(struct ir *ir, void *fallback, uint32_t addr,
                       uint32_t raw_instr);

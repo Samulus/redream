@@ -6,7 +6,6 @@
 #include "hw/dreamcast.h"
 #include "hw/scheduler.h"
 #include "jit/backend/x64/x64_backend.h"
-#include "jit/frontend/armv3/armv3_analyze.h"
 #include "jit/frontend/armv3/armv3_context.h"
 #include "jit/frontend/armv3/armv3_disasm.h"
 #include "jit/frontend/armv3/armv3_frontend.h"
@@ -131,7 +130,7 @@ void arm7_raise_interrupt(struct arm7 *arm, enum arm7_interrupt intr) {
 void arm7_reset(struct arm7 *arm) {
   LOG_INFO("arm7_reset");
 
-  jit_free_blocks(arm->jit);
+  jit_free_cache(arm->jit);
 
   /* reset context */
   memset(&arm->ctx, 0, sizeof(arm->ctx));
@@ -148,48 +147,41 @@ void arm7_suspend(struct arm7 *arm) {
   arm->execute_if->running = 0;
 }
 
-static void arm7_translate(void *data, uint32_t addr, struct ir *ir, int flags,
-                           int *out_size) {
+static void arm7_translate(void *data, struct jit_code *code, struct ir *ir) {
   struct arm7 *arm = data;
-
-  int size;
-  armv3_analyze_block(arm->jit, addr, &flags, &size);
+  struct jit_compile_unit *unit = code->root_unit;
+  struct jit_block_meta *meta = unit->meta;
 
   /* cycle check */
   struct ir_value *remaining_cycles = ir_load_context(
       ir, offsetof(struct armv3_context, remaining_cycles), VALUE_I32);
   struct ir_value *done = ir_cmp_sle(ir, remaining_cycles, ir_alloc_i32(ir, 0));
-  ir_branch_true(ir, ir_alloc_ptr(ir, arm7_dispatch_leave), done);
+  ir_branch_true(ir, done, ir_alloc_ptr(ir, arm7_dispatch_leave));
 
   /* interrupt check */
   struct ir_value *pending_intr = ir_load_context(
       ir, offsetof(struct armv3_context, pending_interrupts), VALUE_I32);
-  ir_branch_true(ir, ir_alloc_ptr(ir, arm7_dispatch_interrupt), pending_intr);
+  ir_branch_true(ir, pending_intr, ir_alloc_ptr(ir, arm7_dispatch_interrupt));
 
   /* update remaining cycles */
-  int cycles = (size / 4) * 12;
-  remaining_cycles = ir_sub(ir, remaining_cycles, ir_alloc_i32(ir, cycles));
+  remaining_cycles = ir_sub(ir, remaining_cycles, ir_alloc_i32(ir, meta->num_cycles));
   ir_store_context(ir, offsetof(struct armv3_context, remaining_cycles),
                    remaining_cycles);
-  CHECK(cycles && size);
 
   /* update instruction run count */
   struct ir_value *ran_instrs = ir_load_context(
       ir, offsetof(struct armv3_context, ran_instrs), VALUE_I64);
-  ran_instrs = ir_add(ir, ran_instrs, ir_alloc_i64(ir, size / 4));
+  ran_instrs = ir_add(ir, ran_instrs, ir_alloc_i64(ir, meta->size / 4));
   ir_store_context(ir, offsetof(struct armv3_context, ran_instrs), ran_instrs);
 
   /* emit fallbacks */
-  for (int i = 0; i < size; i += 4) {
-    uint32_t data = as_read32(arm->memory_if->space, addr + i);
-    armv3_emit_instr((struct armv3_frontend *)arm->frontend, ir, 0, addr + i,
+  for (int i = 0; i < meta->size; i += 4) {
+    uint32_t data = as_read32(arm->memory_if->space, code->guest_addr + i);
+    armv3_emit_instr((struct armv3_frontend *)arm->frontend, ir, 0, code->guest_addr + i,
                      data);
   }
 
   ir_branch(ir, ir_alloc_ptr(ir, arm7_dispatch_dynamic));
-
-  /* return size */
-  *out_size = size;
 }
 
 static void arm7_run(struct device *dev, int64_t ns) {
