@@ -5,7 +5,7 @@
 DEFINE_STAT(loads_removed, "context loads eliminated");
 DEFINE_STAT(stores_removed, "context stores eliminated");
 
-#define MAX_OFFSET 16384
+#define MAX_OFFSET 1024
 
 struct available {
   int offset;
@@ -80,78 +80,123 @@ static void lse_set_available(struct lse *lse, int offset, struct ir_value *v) {
   }
 }
 
-void lse_run_block(struct lse *lse, struct ir *ir, struct ir_block *block) {
-  /* eliminate redundant loads */
-  {
-    lse_clear_available(lse);
+static void lse_eliminate_loads_r(struct ir *ir, struct ir_block *block, struct lse *lse_in) {
+  struct lse lse;
 
-    list_for_each_entry_safe(instr, &block->instrs, struct ir_instr, it) {
-      if (instr->op == OP_LABEL) {
-        lse_clear_available(lse);
-      } else if (instr->op == OP_LOAD_CONTEXT) {
-        /* if there is already a value available for this offset, reuse it and
-           remove this redundant load */
-        int offset = instr->arg[0]->i32;
-        struct ir_value *available = lse_get_available(lse, offset);
+  if (lse_in) {
+    lse = *lse_in;
+  } else {
+    lse_clear_available(&lse);
+  }
 
-        if (available && available->type == instr->result->type) {
-          ir_replace_uses(instr->result, available);
-          ir_remove_instr(ir, instr);
-
-          STAT_loads_removed++;
-
-          continue;
-        }
-
-        lse_set_available(lse, offset, instr->result);
-      } else if (instr->op == OP_STORE_CONTEXT) {
-        int offset = instr->arg[0]->i32;
-
-        /* mark the value being stored as available */
-        lse_set_available(lse, offset, instr->arg[1]);
+  list_for_each_entry_safe(instr, &block->instrs, struct ir_instr, it) {
+    if (instr->op == OP_BRANCH) {
+      if (instr->arg[0]->type != VALUE_BLOCK) {
+        lse_clear_available(&lse);
       }
+    } else if (instr->op == OP_BRANCH_TRUE || instr->op == OP_BRANCH_FALSE) {
+      if (instr->arg[1]->type != VALUE_BLOCK) {
+        lse_clear_available(&lse);
+      }
+    } else if (instr->op == OP_LOAD_CONTEXT) {
+      /* if there is already a value available for this offset, reuse it and
+         remove this redundant load */
+      int offset = instr->arg[0]->i32;
+      struct ir_value *available = lse_get_available(&lse, offset);
+
+      if (available && available->type == instr->result->type) {
+        ir_replace_uses(instr->result, available);
+        ir_remove_instr(ir, instr);
+
+        STAT_loads_removed++;
+
+        continue;
+      }
+
+      lse_set_available(&lse, offset, instr->result);
+    } else if (instr->op == OP_STORE_CONTEXT) {
+      int offset = instr->arg[0]->i32;
+
+      /* mark the value being stored as available */
+      lse_set_available(&lse, offset, instr->arg[1]);
     }
   }
 
-  /* eliminate dead stores */
-  {
-    lse_clear_available(lse);
+  list_for_each_entry(edge, &block->outgoing, struct ir_edge, it) {
+    lse_eliminate_loads_r(ir, edge->dst, &lse);
+  }
+}
 
-    list_for_each_entry_safe_reverse(instr, &block->instrs, struct ir_instr,
-                                     it) {
-      if (instr->op == OP_LABEL) {
-        lse_clear_available(lse);
-      } else if (instr->op == OP_LOAD_CONTEXT) {
-        int offset = instr->arg[0]->i32;
-        int size = ir_type_size(instr->result->type);
+static void lse_eliminate_loads(struct ir *ir) {
+  struct ir_block *head_block = list_first_entry(&ir->blocks, struct ir_block, it);
+  lse_eliminate_loads_r(ir, head_block, NULL);
+}
 
-        lse_erase_available(lse, offset, size);
-      } else if (instr->op == OP_STORE_CONTEXT) {
-        /* if subsequent stores have been made for this offset that would
-           overwrite it completely, mark instruction as dead */
-        int offset = instr->arg[0]->i32;
-        struct ir_value *available = lse_get_available(lse, offset);
-        int available_size = available ? ir_type_size(available->type) : 0;
-        int store_size = ir_type_size(instr->arg[1]->type);
+static void lse_eliminate_stores_r(struct ir *ir, struct ir_block *block, struct lse *lse) {
+  lse_clear_available(lse);
 
-        if (available_size >= store_size) {
-          ir_remove_instr(ir, instr);
+  int first = 1;
+  
+  list_for_each_entry(edge, &block->outgoing, struct ir_edge, it) {
+    struct lse lse_child;
 
-          STAT_stores_removed++;
+    lse_eliminate_stores_r(ir, edge->dst, &lse_child);
 
-          continue;
-        }
-
-        lse_set_available(lse, offset, instr->arg[1]);
+    for (int i = 0; i < MAX_OFFSET; i++) {
+      if (first) {
+        lse->available[i] = lse_child.available[i];
+      } else if (lse->available[i].offset != lse_child.available[i].offset ||
+                 lse->available[i].value != lse_child.available[i].value) {
+        memset(&lse->available[i], 0, sizeof(lse->available[i]));
       }
+    }
+
+    first = 0;
+  }
+
+  list_for_each_entry_safe_reverse(instr, &block->instrs, struct ir_instr,
+                                   it) {
+    if (instr->op == OP_BRANCH) {
+      if (instr->arg[0]->type != VALUE_BLOCK) {
+        lse_clear_available(lse);
+      }
+    } else if (instr->op == OP_BRANCH_TRUE || instr->op == OP_BRANCH_FALSE) {
+      if (instr->arg[1]->type != VALUE_BLOCK) {
+        lse_clear_available(lse);
+      }
+    } else if (instr->op == OP_LOAD_CONTEXT) {
+      int offset = instr->arg[0]->i32;
+      int size = ir_type_size(instr->result->type);
+
+      lse_erase_available(lse, offset, size);
+    } else if (instr->op == OP_STORE_CONTEXT) {
+      /* if subsequent stores have been made for this offset that would
+         overwrite it completely, mark instruction as dead */
+      int offset = instr->arg[0]->i32;
+      struct ir_value *available = lse_get_available(lse, offset);
+      int available_size = available ? ir_type_size(available->type) : 0;
+      int store_size = ir_type_size(instr->arg[1]->type);
+
+      if (available_size >= store_size) {
+        ir_remove_instr(ir, instr);
+        STAT_stores_removed++;
+        continue;
+      }
+
+      lse_set_available(lse, offset, instr->arg[1]);
     }
   }
 }
 
+static void lse_eliminate_stores(struct ir *ir) {
+  struct ir_block *head_block = list_first_entry(&ir->blocks, struct ir_block, it);
+  struct lse lse;
+  lse_eliminate_stores_r(ir, head_block, &lse);
+}
+
 void lse_run(struct lse *lse, struct ir *ir) {
-  list_for_each_entry(block, &ir->blocks, struct ir_block, it) {
-    lse_run_block(lse, ir, block);
-  }
+  lse_eliminate_loads(ir);
+  lse_eliminate_stores(ir);
 }
 
 void lse_destroy(struct lse *lse) {
